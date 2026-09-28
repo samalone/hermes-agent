@@ -14,22 +14,61 @@
  * and its integrity checksum. Disabling `disableAsarIntegrity` would also
  * "fix" it, at the cost of the integrity check on every Windows build.
  *
- * Windows-only: rcedit edits PE resources, irrelevant on macOS/Linux where the
- * app identity comes from the bundle Info.plist / desktop entry. Best-effort:
- * a stamp failure must never fail an otherwise-good build (worst case is the
+ * Windows: rcedit edits PE resources, irrelevant on macOS/Linux where the app
+ * identity comes from the bundle Info.plist / desktop entry. Best-effort: a
+ * stamp failure must never fail an otherwise-good build (worst case is the
  * stock icon, not a broken app), so we log and resolve rather than throw.
+ *
+ * macOS: restamps the launcher's Mach-O LC_UUID (scripts/set-macho-uuid.mjs)
+ * so Local Network privacy stops resolving Hermes as com.github.Electron
+ * (#81563). Done here for the same reason: the Electron.app is still pristine
+ * and unsigned, so osx-sign's normal pass covers the edit. Also best-effort —
+ * without it the app still runs; it just can't reach LAN hosts on macOS 15+.
  *
  * electron-builder passes a context with:
  *   - electronPlatformName: 'win32' | 'darwin' | 'linux'
  *   - appOutDir:            the unpacked Electron directory
  *   - packager.config.electronBranding.projectName: source binary basename
+ *   - packager.appInfo.id:  the appId (macOS UUID seed)
  */
 
+import fs from 'node:fs/promises'
 import path from 'node:path'
 
 import { stampExeIdentity } from './set-exe-identity.mjs'
+import { stampMachoUuid } from './set-macho-uuid.mjs'
+
+/** The single executable in <appOutDir>/<Name>.app/Contents/MacOS, pre-rename. */
+async function macLauncher(appOutDir) {
+  const apps = (await fs.readdir(appOutDir)).filter(name => name.endsWith('.app'))
+  if (apps.length !== 1) {
+    throw new Error(`expected one .app in ${appOutDir}, found ${apps.length}`)
+  }
+  const macosDir = path.join(appOutDir, apps[0], 'Contents', 'MacOS')
+  const entries = await fs.readdir(macosDir)
+  if (entries.length !== 1) {
+    throw new Error(`expected one executable in ${macosDir}, found ${entries.length}`)
+  }
+  return path.join(macosDir, entries[0])
+}
+
+async function stampMacLauncherUuid(context) {
+  const appId = context.packager?.appInfo?.id
+  try {
+    const launcher = await macLauncher(context.appOutDir)
+    for (const { from, to } of await stampMachoUuid(launcher, appId)) {
+      console.log(`[after-extract] ${path.basename(launcher)} LC_UUID ${from} -> ${to}`)
+    }
+  } catch (err) {
+    console.warn(`[after-extract] LC_UUID stamp failed (${err.message}); macOS Local Network privacy will treat the app as com.github.Electron`)
+  }
+}
 
 export default async function afterExtract(context) {
+  if (context.electronPlatformName === 'darwin') {
+    await stampMacLauncherUuid(context)
+    return
+  }
   if (context.electronPlatformName !== 'win32') {
     return
   }
